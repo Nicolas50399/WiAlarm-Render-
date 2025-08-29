@@ -1,0 +1,30 @@
+{
+  "name": "wialarm-back",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.0.0",
+    "expo-server-sdk": "^4.0.0",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "mercadopago": "^2.8.0",
+    "mongodb": "^6.17.0",
+    "mongoose": "^8.16.1",
+    "socket.io": "^4.8.1"
+  }
+}
