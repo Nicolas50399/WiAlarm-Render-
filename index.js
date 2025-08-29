@@ -25,6 +25,8 @@ app.use(session({
 
 const JWT_SECRET = process.env.JWT_SECRET; // guardalo en .env
 
+app.get("/", (req, res) => res.send("Servidor activo 🚀"));
+
 //======================================== USUARIOS ========================================
 
 app.post('/api/registro', async (req, res) => {
