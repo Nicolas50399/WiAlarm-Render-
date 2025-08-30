@@ -8,7 +8,8 @@ const PORT = process.env.PORT;
 
 // Middleware
 app.use(cors({
-  origin: "*",
+  origin: ["http://192.168.0.4:3000", "https://wialarm-render.onrender.com"], // tus frontends
+  credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
@@ -24,7 +25,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: true } // true si usás HTTPS
+  cookie: { secure: false } // true si usás HTTPS
 }));
 
 const JWT_SECRET = process.env.JWT_SECRET; // guardalo en .env
