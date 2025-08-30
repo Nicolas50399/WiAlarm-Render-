@@ -7,7 +7,11 @@ const app = express();
 const PORT = process.env.PORT;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 app.use(express.json());
 
 const jwt = require('jsonwebtoken');
@@ -20,7 +24,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false } // true si usás HTTPS
+  cookie: { secure: true } // true si usás HTTPS
 }));
 
 const JWT_SECRET = process.env.JWT_SECRET; // guardalo en .env
@@ -57,6 +61,41 @@ app.post('/api/registro', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, msg: 'Error al registrar usuario' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { email, clave } = req.body;
+
+  try {
+    const usuario = await Usuario.findOne({ email });
+    if (!usuario) {
+      return res.status(401).json({ ok: false, msg: 'Usuario no encontrado' });
+    }
+
+    const coincide = await bcrypt.compare(clave, usuario.clave);
+    if (!coincide) {
+      return res.status(401).json({ ok: false, msg: 'Contraseña incorrecta' });
+    }
+
+    const payload = {
+      id: usuario._id,
+      nombre: usuario.nombre,
+      email: usuario.email,
+    };
+
+    req.session.idUsuario = usuario._id;
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+
+    res.status(200).json({
+      ok: true,
+      msg: 'Login exitoso',
+      token,
+      usuario: payload, // opcional si querés mostrar datos del usuario
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, msg: 'Error al iniciar sesión' });
   }
 });
 
