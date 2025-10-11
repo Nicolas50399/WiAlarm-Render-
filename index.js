@@ -30,6 +30,9 @@ app.use(session({
 
 const JWT_SECRET = process.env.JWT_SECRET; // guardalo en .env
 
+const { OAuth2Client } = require('google-auth-library');
+const client = new OAuth2Client("TU_WEB_CLIENT_ID.apps.googleusercontent.com");
+
 app.get("/", (req, res) => res.send("Servidor activo 🚀"));
 
 //======================================== USUARIOS ========================================
@@ -100,38 +103,49 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.post('/api/login', async (req, res) => {
-  const { email, clave } = req.body;
-
+app.post('/api/logingoogle', async (req, res) => {
   try {
-    const usuario = await Usuario.findOne({ email });
+    const { id_token } = req.body;
+
+    // Verificar el token con Google
+    const ticket = await client.verifyIdToken({
+      idToken: id_token,
+      audience: process.env.WEB_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const { email, given_name, family_name } = payload;
+
+    // Buscar si el usuario ya existe
+    let usuario = await Usuario.findOne({ email });
+
     if (!usuario) {
-      return res.status(401).json({ ok: false, msg: 'Usuario no encontrado' });
+      // Crear uno nuevo con clave vacía (porque es login social)
+      usuario = new Usuario({
+        nombre: given_name || '',
+        apellido: family_name || '',
+        email,
+        clave: await bcrypt.hash(Math.random().toString(36).slice(-8), 10),
+      });
+      await usuario.save();
     }
 
-    const coincide = await bcrypt.compare(clave, usuario.clave);
-    if (!coincide) {
-      return res.status(401).json({ ok: false, msg: 'Contraseña incorrecta' });
-    }
+    // Generar token JWT
+    const token = jwt.sign(
+      { id: usuario._id, email: usuario.email, nombre: usuario.nombre },
+      JWT_SECRET,
+      { expiresIn: '1h' }
+    );
 
-    const payload = {
-      id: usuario._id,
-      nombre: usuario.nombre,
-      email: usuario.email,
-    };
-
-    req.session.idUsuario = usuario._id;
-    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
-
-    res.status(200).json({
+    res.json({
       ok: true,
-      msg: 'Login exitoso',
+      msg: 'Login Google exitoso',
       token,
-      usuario: payload, // opcional si querés mostrar datos del usuario
+      usuario: { nombre: usuario.nombre, email: usuario.email },
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, msg: 'Error al iniciar sesión' });
+    res.status(500).json({ ok: false, msg: 'Error al autenticar con Google' });
   }
 });
 
@@ -141,8 +155,17 @@ app.get('/api/usuario', async (req, res) => {
       return res.status(401).json({ ok: false, msg: 'No hay sesión activa' });
     }
 
-    const usuario = await Usuario.findById(req.session.idUsuario).select('-clave'); 
-    // con .select('-clave') evitás mandar la clave en la respuesta
+    // Busco el usuario y si es PREMIUM, le hago populate de adherentes
+    const usuario = await Usuario.findById(req.session.idUsuario)
+      .select('-clave') // no enviamos la clave
+      .populate({
+        path: 'adherentes',
+        select: 'nombre apellido email tipo', // los campos que querés mostrar
+      })
+      .populate({
+        path: 'premiumRef',
+        select: 'nombre apellido email', // si es adherente, podés mostrar su premium
+      });
 
     if (!usuario) {
       return res.status(404).json({ ok: false, msg: 'Usuario no encontrado' });
@@ -153,10 +176,11 @@ app.get('/api/usuario', async (req, res) => {
       usuario,
     });
   } catch (err) {
-    console.error(err);
+    console.error('Error en /api/usuario:', err);
     res.status(500).json({ ok: false, msg: 'Error al obtener usuario' });
   }
 });
+
 
 //SUSCRIPCION A PREMIUM
 app.put('/api/usuario/premium', async (req, res) => {
@@ -197,6 +221,115 @@ app.put('/api/usuario/normal', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, msg: 'Error al actualizar usuario' });
+  }
+});
+
+app.post('/api/adherente', async (req, res) => {
+  try {
+    const { nombre, apellido, email, clave } = req.body;
+
+    console.log("USUARIO PREMIUM? " + req.session.idUsuario)
+
+    // Buscamos el usuario autenticado (el premium)
+    const usuario = await Usuario.findById(req.session.idUsuario);
+
+    if (!usuario || usuario.tipo !== 'PREMIUM') {
+      return res.status(403).json({ ok: false, error: 'Solo usuarios PREMIUM pueden crear adherentes' });
+    }
+
+    // Validar límite de adherentes
+    const maxAdherentes = parseInt(process.env.MAXIMO_ADHERENTES || 3);
+    if (usuario.adherentes.length >= maxAdherentes) {
+      return res.status(400).json({ ok: false, error: 'Has alcanzado el máximo de adherentes' });
+    }
+
+    // Verificar si el email ya existe
+    const existente = await Usuario.findOne({ email });
+    if (existente) {
+      return res.status(400).json({ ok: false, error: 'El email ya está registrado' });
+    }
+
+    const claveHasheada = await bcrypt.hash(clave, saltRounds);
+
+    // Crear el adherente
+    const adherente = new Usuario({
+      nombre,
+      apellido,
+      email,
+      clave: claveHasheada,
+      tipo: 'ADHERENTE',
+      premiumRef: usuario._id // vínculo con el premium
+    });
+
+    await adherente.save();
+
+    // Agregar adherente a la lista del premium
+    usuario.adherentes.push(adherente._id);
+    await usuario.save();
+
+    res.json({ ok: true, adherente });
+  } catch (err) {
+    console.error("Error al crear adherente:", err);
+    res.status(500).json({ ok: false, error: 'Error interno del servidor' });
+  }
+});
+
+
+app.put('/api/usuario/:id', async (req, res) => {
+  try {
+    const { nombre, apellido, email } = req.body;
+
+    // Verificar si el usuario de sesión coincide con el que intenta modificar
+    if (!req.session.idUsuario) {
+      return res.status(401).json({ ok: false, msg: 'No autorizado' });
+    }
+
+    const usuario = await Usuario.findById(req.params.id);
+    if (!usuario) return res.status(404).json({ ok: false, msg: 'Usuario no encontrado' });
+
+    // Actualizar datos personales si están presentes
+    if (nombre) usuario.nombre = nombre;
+    if (apellido) usuario.apellido = apellido;
+    if (email) usuario.email = email;
+
+    await usuario.save();
+
+    res.json({
+      ok: true,
+      msg: 'Usuario actualizado correctamente',
+      usuario: {
+        nombre: usuario.nombre,
+        apellido: usuario.apellido,
+        email: usuario.email,
+      },
+    });
+  } catch (err) {
+    console.error('Error al actualizar usuario:', err);
+    res.status(500).json({ ok: false, msg: 'Error interno del servidor' });
+  }
+});
+
+app.delete('/api/adherente/:id', async (req, res) => {
+  try {
+    const usuario = await Usuario.findById(req.session.idUsuario); // usar session
+
+    if (!usuario || usuario.tipo !== 'PREMIUM') 
+      return res.status(403).json({ ok: false, error: 'Solo usuarios PREMIUM pueden eliminar adherentes' });
+
+    if (!usuario.adherentes.includes(req.params.id))
+      return res.status(403).json({ ok: false, error: 'Adherente no pertenece a tu cuenta' });
+
+    // Eliminar el usuario adherente de la colección
+    await Usuario.findByIdAndDelete(req.params.id);
+
+    // Sacarlo del array de adherentes
+    usuario.adherentes = usuario.adherentes.filter(a => a.toString() !== req.params.id);
+    await usuario.save();
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -301,6 +434,35 @@ app.delete('/api/regiones/:id_reg', async (req, res) => {
 });
 
 //======================================== DISPOSITIVO ESP32 ========================================
+
+app.get('/api/usuario/verificar-dispositivos', async (req, res) => {
+  try {
+    console.log("VERIFICANDO")
+    const usuario = await Usuario.findById(req.session.idUsuario);
+    if (!usuario) return res.status(404).json({ ok: false, error: 'Usuario no encontrado' });
+
+    // Obtenemos todas las regiones del usuario
+    const regiones = await Region.find({ userId: usuario._id });
+
+    // Contamos todos los dispositivos de todas las regiones del usuario
+    const regionIds = regiones.map(r => r._id.toString());
+    const cantidadDispositivos = await Dispositivo.countDocuments({ regionId: { $in: regionIds } });
+    const maxDispositivos = process.env.MAXIMO_DISPOSITIVOS_CUENTA_NORMAL;
+    const puedeAgregar = !(usuario.tipo === 'NORMAL' && cantidadDispositivos >= maxDispositivos);
+    console.log(puedeAgregar);
+    res.json({
+      ok: true,
+      tipo: usuario.tipo,
+      cantidadDispositivos,
+      puedeAgregar,
+      maxDispositivos,
+    });
+
+  } catch (err) {
+    console.error("Error en verificar dispositivos:", err);
+    res.status(500).json({ ok: false, error: 'Error interno del servidor' });
+  }
+});
 
 app.get('/api/regiones/:id/dispositivos', async (req, res) => {
   const idUsuario = req.session.idUsuario;
@@ -416,10 +578,24 @@ app.delete('/api/regiones/:id_reg/dispositivos/:id_disp', async (req, res) => {
 
 //======================================== CAMARA ========================================
 
+app.get('/api/camaras/:id', async (req, res) => {
+  try {
+    const camara = await Camara.findById(req.params.id);
+    if (!camara) return res.status(404).json({ message: 'Cámara no encontrada' });
+    res.json(camara);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Error al obtener la cámara' });
+  }
+});
+
+
 app.get('/api/regiones/:id_reg/dispositivos/:id_disp/camara', async (req, res) => {
   try {
     const idUsuario = req.session.idUsuario;
     const { id_reg, id_disp } = req.params;
+    console.log("region: " + id_reg);
+    console.log("dispositivo: " + id_disp);
 
     const regionIdObj = new mongoose.Types.ObjectId(id_reg);
     const dispositivoIdObj = new mongoose.Types.ObjectId(id_disp);
@@ -453,27 +629,44 @@ app.get('/api/regiones/:id_reg/dispositivos/:id_disp/camara', async (req, res) =
 app.delete('/api/camaras/:id_cam', async (req, res) => {
   try {
     const idUsuario = req.session.idUsuario;
-    if (!idUsuario) return res.status(401).json({ message: 'Usuario no autenticado' });
+    if (!idUsuario) {
+      return res.status(401).json({ message: 'Usuario no autenticado' });
+    }
 
     const { id_cam } = req.params;
 
-    // Verifico que la cámara existe y pertenece a un dispositivo de una región del usuario
+    // Verifico que la cámara existe
     const camara = await Camara.findById(id_cam);
-    if (!camara) return res.status(404).json({ message: 'Cámara no encontrada' });
+    if (!camara) {
+      return res.status(404).json({ message: 'Cámara no encontrada' });
+    }
 
-    const dispositivo = await Dispositivo.findOne({ _id: camara.dispositivoId });
-    if (!dispositivo) return res.status(404).json({ message: 'Dispositivo asociado no encontrado' });
+    // Busco el dispositivo asociado
+    const dispositivo = await Dispositivo.findById(camara.dispositivoId);
+    if (!dispositivo) {
+      return res.status(404).json({ message: 'Dispositivo asociado no encontrado' });
+    }
 
-    const regionIdObj = new mongoose.Types.ObjectId(dispositivo.regionId);
+    // Verifico que el dispositivo pertenece a una región del usuario
+    const region = await Region.findOne({ _id: dispositivo.regionId, userId: idUsuario });
+    if (!region) {
+      return res.status(403).json({ message: 'No autorizado a eliminar esta cámara' });
+    }
 
-    const region = await Region.findOne({ _id: regionIdObj, userId: idUsuario });
-    if (!region) return res.status(403).json({ message: 'No autorizado a eliminar esta cámara' });
-
+    // 1️⃣ Borro la cámara
     await Camara.findByIdAndDelete(id_cam);
-    res.json({ message: 'Cámara eliminada correctamente' });
+
+    // 2️⃣ Limpio el camaraId en el dispositivo
+    dispositivo.camaraId = null;
+    await dispositivo.save();
+
+    res.json({
+      message: 'Cámara eliminada correctamente y relación con el dispositivo eliminada',
+      dispositivoActualizado: dispositivo,
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: 'Error al eliminar la cámara' });
+    res.status(500).json({ message: 'Error al eliminar la cámara', error: error.message });
   }
 });
 
@@ -485,7 +678,7 @@ app.post('/api/regiones/:id_reg/dispositivos/:id_disp/addcam', async (req, res) 
     }
 
     const { id_reg, id_disp } = req.params;
-    const { nombre, streamUrl, tipo } = req.body;
+    const { tipo, activo, streamUrl } = req.body;
 
     // Verifico que la región existe y pertenece al usuario
     const region = await Region.findOne({ _id: id_reg, userId: idUsuario });
@@ -501,18 +694,25 @@ app.post('/api/regiones/:id_reg/dispositivos/:id_disp/addcam', async (req, res) 
 
     // Creo la cámara asociada al dispositivo
     const nuevaCamara = new Camara({
-      nombre,
       streamUrl,
-      tipo: tipo || 'integrada', // default si no mandás nada
-      activo: true,
-      dispositivoId: id_disp
+      activo,
+      dispositivoId: id_disp,
+      tipo,
     });
     await nuevaCamara.save();
 
-    res.status(201).json({ message: 'Cámara agregada correctamente', camara: nuevaCamara });
+    // Actualizo el dispositivo con el ID de la nueva cámara (relación 1 a 1)
+    dispositivo.camaraId = nuevaCamara._id;
+    await dispositivo.save();
+
+    res.status(201).json({
+      message: 'Cámara agregada y asociada correctamente al dispositivo',
+      camara: nuevaCamara,
+      dispositivo,
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: 'Error al agregar la cámara' });
+    res.status(500).json({ message: 'Error al agregar la cámara', error: error.message });
   }
 });
 
