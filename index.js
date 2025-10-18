@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const axios = require('axios');
 const Usuario = require('./models/Usuario');
 require('dotenv').config();
 
@@ -350,7 +351,7 @@ app.get('/api/regiones', async (req, res) => {
 app.post('/api/regiones/add', async (req, res) => {
   try {
     const userId = req.session.idUsuario;
-    const { nombre, direccion, ciudad } = req.body;
+    const { nombre, direccion, ciudad, modoDeteccion } = req.body;
 
     if (!nombre || !direccion || !ciudad) {
       return res.status(400).json({ message: 'Todos los campos son requeridos.' });
@@ -360,7 +361,8 @@ app.post('/api/regiones/add', async (req, res) => {
       nombre,
       direccion,
       ciudad,
-      userId
+      userId,
+      modoDeteccion
     });
 
     const savedRegion = await nuevaRegion.save();
@@ -377,27 +379,72 @@ app.put('/api/regiones/:id_reg', async (req, res) => {
   if (!idUsuario) return res.status(401).json({ message: 'Usuario no autenticado' });
 
   const { id_reg } = req.params;
-  const { nombre, direccion, ciudad } = req.body;
+  const { nombre, direccion, ciudad, modoDeteccion } = req.body;
 
   try {
-    // Buscar la región y verificar que pertenece al usuario
+    // 1. Buscar la región y verificar que pertenece al usuario
     const region = await Region.findOne({ _id: id_reg, userId: idUsuario });
     if (!region) {
       return res.status(404).json({ message: 'Región no encontrada' });
     }
 
-    // Actualizar campos si fueron enviados
+    // 2. Guardar el modo anterior para compararlo después
+    const modoAnterior = region.modoDeteccion;
+
+    // 3. Verificar si el modo de detección ha cambiado
+    const modoCambiado = modoDeteccion && modoDeteccion !== modoAnterior;
+
+    if (modoCambiado) {
+      console.log(`El modo de la región '${region.nombre}' cambió de ${modoAnterior} a ${modoDeteccion}. Actualizando dispositivos...`);
+
+      // 4. Buscar todos los dispositivos de la región
+      const dispositivos = await Dispositivo.find({ regionId: id_reg });
+
+      if (dispositivos.length > 0) {
+        const externalApiUrl = 'http://192.168.1.3:8000'; // O la URL de tu mock
+        
+        // 5. Iterar sobre cada dispositivo para actualizar su estado en la API externa
+        for (const dispositivo of dispositivos) {
+          try {
+            const payload = {
+              mac: dispositivo.macAddress,
+              account_id: idUsuario
+            };
+
+            // Determinar los endpoints de 'stop' y 'start'
+            const stopEndpoint = modoAnterior === 'ALARMA' ? '/api/mobile/alarm/stop' : '/api/mobile/care/stop';
+            const startEndpoint = modoDeteccion === 'ALARMA' ? '/api/mobile/alarm/start' : '/api/mobile/care/start';
+
+            // Llamada para desactivar el modo anterior
+            console.log(` -> Desactivando modo ${modoAnterior} para MAC ${dispositivo.macAddress}`);
+            await axios.post(`${externalApiUrl}${stopEndpoint}`, payload);
+
+            // Llamada para activar el nuevo modo
+            console.log(` -> Activando modo ${modoDeteccion} para MAC ${dispositivo.macAddress}`);
+            await axios.post(`${externalApiUrl}${startEndpoint}`, payload);
+
+          } catch (apiError) {
+            // Si falla la actualización de un dispositivo, lo registramos pero continuamos
+            console.error(`Error al actualizar el dispositivo ${dispositivo.macAddress} en la API externa:`, apiError.message);
+          }
+        }
+      }
+    }
+
+    // 6. Actualizar campos de la región en la base de datos
     if (nombre !== undefined) region.nombre = nombre;
     if (direccion !== undefined) region.direccion = direccion;
     if (ciudad !== undefined) region.ciudad = ciudad;
+    if (modoDeteccion !== undefined) region.modoDeteccion = modoDeteccion;
 
-    // Guardar cambios
+    // 7. Guardar cambios
     await region.save();
 
-    res.json({ message: 'Región actualizada', region });
+    res.json({ message: 'Región actualizada correctamente', region });
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Error al actualizar la región' });
+    console.error('Error general al actualizar la región:', err);
+    res.status(500).json({ message: 'Error interno al actualizar la región' });
   }
 });
 
@@ -484,22 +531,61 @@ app.post('/api/regiones/:id/dispositivos/add', async (req, res) => {
     }
 
     const { id } = req.params; // id de la región
-
     const { nombre, mac } = req.body;
     
-
     if (!nombre || !mac) {
       return res.status(400).json({ message: 'Todos los campos son requeridos.' });
     }
 
+    // --- PASO 1: Buscar la región para obtener su modo de detección ---
+    const region = await Region.findById(id);
+    if (!region) {
+      return res.status(404).json({ message: 'La región especificada no existe.' });
+    }
+
+    // --- PASO 2: Guardar el nuevo dispositivo en la base de datos ---
     const nuevoDispositivo = new Dispositivo({
       nombre: nombre,
       macAddress: mac,
       regionId: id,
       activo: true
     });
-
     const savedDispositivo = await nuevoDispositivo.save();
+
+    // --- PASO 3: Realizar el fetch a la API externa ---
+    const externalApiUrl = process.env.API_CENTRAL_URL;
+    let endpointToCall = '';
+
+    // Determinamos qué endpoint usar basado en el modo de la región
+    if (region.modoDeteccion === 'ALARMA') {
+      endpointToCall = '/api/mobile/alarm/start';
+    } else if (region.modoDeteccion === 'CUIDADO') {
+      endpointToCall = '/api/mobile/care/start';
+    }
+
+    // Solo hacemos la llamada si tenemos un endpoint válido
+    if (endpointToCall) {
+      try {
+        const payload = {
+          mac: mac,
+          account_id: idUsuario
+        };
+
+        console.log(`Enviando petición a ${externalApiUrl}${endpointToCall} con payload:`, payload);
+        
+        // Usamos axios para hacer la petición POST
+        await axios.post(`${externalApiUrl}${endpointToCall}`, payload);
+
+        console.log(`Activación exitosa en la API externa para el dispositivo ${mac}.`);
+
+      } catch (externalApiError) {
+        // ¡Importante! Si la API externa falla, solo lo registramos en la consola.
+        // No devolvemos un error al usuario, porque el dispositivo SÍ se guardó correctamente.
+        console.error('Error al contactar la API externa para activar el modo:', externalApiError.message);
+      }
+    }
+
+    // La respuesta al cliente sigue siendo exitosa.
     res.status(201).json(savedDispositivo);
 
   } catch (error) {
@@ -680,19 +766,49 @@ app.post('/api/regiones/:id_reg/dispositivos/:id_disp/addcam', async (req, res) 
     const { id_reg, id_disp } = req.params;
     const { tipo, activo, streamUrl } = req.body;
 
-    // Verifico que la región existe y pertenece al usuario
+    // 1. Verifico que la región y el dispositivo existen y pertenecen al usuario
     const region = await Region.findOne({ _id: id_reg, userId: idUsuario });
     if (!region) {
       return res.status(404).json({ message: 'Región no encontrada' });
     }
-
-    // Verifico que el dispositivo existe y pertenece a la región
     const dispositivo = await Dispositivo.findOne({ _id: id_disp, regionId: id_reg });
     if (!dispositivo) {
       return res.status(404).json({ message: 'Dispositivo no encontrado en esta región' });
     }
 
-    // Creo la cámara asociada al dispositivo
+    // --- NUEVA LÓGICA DE ACTIVACIÓN ---
+    // 2. Antes de guardar nada, intentamos activar la cámara en la API externa
+    try {
+      const externalApiUrl = 'http://192.168.1.3:8000'; // O la URL de tu mock para pruebas
+      const payload = {
+        mac: dispositivo.macAddress,
+        account_id: idUsuario,
+        tipo: tipo,
+        activo: activo,
+      };
+
+      console.log('Intentando activar cámara en API externa con payload:', payload);
+      
+      const apiResponse = await axios.post(`${externalApiUrl}/api/mobile/camera/activate`, payload);
+
+      // Verificamos si la respuesta de la API externa indica un fallo
+      if (apiResponse.data.success === false) {
+        throw new Error(apiResponse.data.message || 'La API externa reportó un error de activación.');
+      }
+
+      console.log('Activación de cámara exitosa en la API externa.');
+
+    } catch (apiError) {
+      // Si la llamada a la API externa falla, detenemos toda la operación.
+      console.error('Fallo al contactar la API externa para activar la cámara:', apiError.message);
+      // Devolvemos un error 502 (Bad Gateway) que indica que un servidor intermediario falló.
+      return res.status(502).json({ 
+        message: 'No se pudo activar la cámara en el dispositivo. La operación fue cancelada.',
+        error: apiError.message 
+      });
+    }
+
+    // 3. Si la activación fue exitosa, procedemos a guardar en nuestra base de datos
     const nuevaCamara = new Camara({
       streamUrl,
       activo,
@@ -701,18 +817,18 @@ app.post('/api/regiones/:id_reg/dispositivos/:id_disp/addcam', async (req, res) 
     });
     await nuevaCamara.save();
 
-    // Actualizo el dispositivo con el ID de la nueva cámara (relación 1 a 1)
     dispositivo.camaraId = nuevaCamara._id;
     await dispositivo.save();
 
     res.status(201).json({
-      message: 'Cámara agregada y asociada correctamente al dispositivo',
+      message: 'Cámara activada y guardada correctamente',
       camara: nuevaCamara,
       dispositivo,
     });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Error al agregar la cámara', error: error.message });
+    console.error('Error general al agregar la cámara:', error);
+    res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   }
 });
 
