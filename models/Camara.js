@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const CamaraSchema = new mongoose.Schema({
   streamUrl: { type: String, required: false },
   activo: { type: Boolean, required: true },
-  dispositivoId: { type: mongoose.Schema.Types.ObjectId, ref: 'Dispositivo', required: true },
+  dispositivoId: { type: String, required: true },
   tipo: { 
     type: String, 
     enum: ['retransmision', 'grabacion'], 

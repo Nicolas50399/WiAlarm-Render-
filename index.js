@@ -6,6 +6,7 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT;
+const UrlApiCentral = process.env.API_MOCK_URL
 
 // Middleware
 app.use(cors({
@@ -401,7 +402,7 @@ app.put('/api/regiones/:id_reg', async (req, res) => {
       const dispositivos = await Dispositivo.find({ regionId: id_reg });
 
       if (dispositivos.length > 0) {
-        const externalApiUrl = 'http://192.168.1.3:8000'; // O la URL de tu mock
+        const externalApiUrl = UrlApiCentral; // O la URL de tu mock
         
         // 5. Iterar sobre cada dispositivo para actualizar su estado en la API externa
         for (const dispositivo of dispositivos) {
@@ -523,6 +524,95 @@ app.get('/api/regiones/:id/dispositivos', async (req, res) => {
   res.json(dispositivos);
 });
 
+app.get('/api/dispositivos/all', async (req, res) => {
+  const idUsuario = req.session.idUsuario;
+  if (!idUsuario) {
+    return res.status(401).json({ message: 'Usuario no autenticado' });
+  }
+
+  try {
+    // 1. Encontrar regiones del usuario
+    const regionesUsuario = await Region.find({ userId: idUsuario }).lean(); // Usar lean para objetos planos
+    const regionMap = regionesUsuario.reduce((map, region) => {
+      map[region._id.toString()] = region.nombre;
+      return map;
+    }, {});
+    const regionIds = Object.keys(regionMap);
+    console.log('Mapa de Regiones:', regionMap);
+
+    if (regionIds.length === 0) return res.json([]);
+
+    // 2. Buscar dispositivos de esas regiones
+    // Usamos lean() para obtener objetos JS planos, más fácil de manipular
+    const dispositivosUsuario = await Dispositivo.find({ regionId: { $in: regionIds } }).lean();
+    console.log(`Dispositivos encontrados: ${dispositivosUsuario.length}`);
+
+    if (dispositivosUsuario.length === 0) return res.json([]);
+
+    // Extraer IDs de dispositivos y cámaras para las siguientes búsquedas
+    const dispositivoIds = dispositivosUsuario.map(d => d._id.toString());
+    // Filtramos para obtener solo los camaraId que NO son null o undefined
+    const camaraIds = dispositivosUsuario
+        .map(d => d.camaraId)
+        .filter(id => id != null); // != null chequea null y undefined
+
+    console.log('IDs de Cámaras a buscar:', camaraIds);
+
+    // 3. Buscar las cámaras correspondientes (solo si hay IDs de cámara)
+    let camaraMap = {}; // Mapa vacío por defecto
+    if (camaraIds.length > 0) {
+        const camaras = await Camara.find({ _id: { $in: camaraIds } }).lean(); // Buscar por _id de cámara
+        console.log(`Cámaras encontradas: ${camaras.length}`);
+
+        // Crear mapa [camaraIdString -> camaraData]
+        camaraMap = camaras.reduce((map, camara) => {
+            map[camara._id.toString()] = { // La clave es el _id de la CÁMARA
+                _id: camara._id.toString(),
+                streamUrl: camara.streamUrl,
+                activo: camara.activo,
+                tipo: camara.tipo
+                // No necesitamos dispositivoId aquí
+            };
+            return map;
+        }, {});
+         console.log('Mapa de Cámaras (CamaraID -> CamaraData):', camaraMap);
+    }
+
+
+    // 4. Combinar la información
+    const resultadoFinal = dispositivosUsuario.map(dispositivo => {
+      const regionIdStr = String(dispositivo.regionId); // Asegurar string
+      const camaraIdStr = dispositivo.camaraId ? String(dispositivo.camaraId) : null; // Asegurar string o null
+
+      // Añadir nombre de la región
+      dispositivo.regionNombre = regionMap[regionIdStr] || 'Región Desconocida';
+      if (!regionMap[regionIdStr]) {
+          console.warn(`WARN: Nombre NO encontrado para regionId "${regionIdStr}" (Dispositivo: ${dispositivo.nombre})`);
+      }
+
+      // Añadir datos de la cámara usando el camaraIdStr como clave en camaraMap
+      dispositivo.camaraData = camaraIdStr ? (camaraMap[camaraIdStr] || null) : null;
+      if (camaraIdStr && !camaraMap[camaraIdStr]) {
+          console.warn(`WARN: Datos de Cámara NO encontrados para camaraId "${camaraIdStr}" (Dispositivo: ${dispositivo.nombre})`);
+      }
+
+      // Opcional: eliminar IDs si no los necesitas más en el frontend
+      // delete dispositivo.regionId;
+      // delete dispositivo.camaraId;
+
+      return dispositivo; // Ya es un objeto plano por lean()
+    });
+
+    // 5. Devolver la lista combinada
+    console.log('Enviando resultado final al frontend.');
+    res.json(resultadoFinal);
+
+  } catch (error) {
+    console.error('Error al obtener todos los dispositivos del usuario:', error);
+    res.status(500).json({ message: 'Error interno del servidor.' });
+  }
+});
+
 app.post('/api/regiones/:id/dispositivos/add', async (req, res) => {
   try {
     const idUsuario = req.session.idUsuario;
@@ -553,7 +643,7 @@ app.post('/api/regiones/:id/dispositivos/add', async (req, res) => {
     const savedDispositivo = await nuevoDispositivo.save();
 
     // --- PASO 3: Realizar el fetch a la API externa ---
-    const externalApiUrl = process.env.API_CENTRAL_URL;
+    const externalApiUrl = UrlApiCentral;
     let endpointToCall = '';
 
     // Determinamos qué endpoint usar basado en el modo de la región
@@ -779,7 +869,7 @@ app.post('/api/regiones/:id_reg/dispositivos/:id_disp/addcam', async (req, res) 
     // --- NUEVA LÓGICA DE ACTIVACIÓN ---
     // 2. Antes de guardar nada, intentamos activar la cámara en la API externa
     try {
-      const externalApiUrl = 'http://192.168.1.3:8000'; // O la URL de tu mock para pruebas
+      const externalApiUrl = UrlApiCentral; // O la URL de tu mock para pruebas
       const payload = {
         mac: dispositivo.macAddress,
         account_id: idUsuario,
