@@ -10,6 +10,7 @@ const RegionSchema = new mongoose.Schema({
     enum: ["ALARMA", "CUIDADO"],
     default: "ALARMA"
   },
+  activada: { type: Boolean, required: false, default: false }
 });
 
 module.exports = mongoose.model('Region', RegionSchema);

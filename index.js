@@ -6,7 +6,7 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT;
-const UrlApiCentral = process.env.API_MOCK_URL
+const UrlApiCentral = process.env.API_CENTRAL_URL
 
 // Middleware
 app.use(cors({
@@ -62,8 +62,18 @@ app.post('/api/registro', async (req, res) => {
     });
 
     await nuevoUsuario.save();
+    
+    const usuarioParaDevolver = {
+      _id: nuevoUsuario._id,
+      nombre: nuevoUsuario.nombre,
+      email: nuevoUsuario.email
+    };
 
-    res.status(201).json({ ok: true, msg: 'Usuario registrado' });
+    res.status(201).json({ 
+      ok: true, 
+      msg: 'Usuario registrado', 
+      usuario: usuarioParaDevolver
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, msg: 'Error al registrar usuario' });
@@ -85,7 +95,7 @@ app.post('/api/login', async (req, res) => {
     }
 
     const payload = {
-      id: usuario._id,
+      _id: usuario._id,
       nombre: usuario.nombre,
       email: usuario.email,
     };
@@ -411,18 +421,11 @@ app.put('/api/regiones/:id_reg', async (req, res) => {
               mac: dispositivo.macAddress,
               account_id: idUsuario
             };
-
-            // Determinar los endpoints de 'stop' y 'start'
-            const stopEndpoint = modoAnterior === 'ALARMA' ? '/api/mobile/alarm/stop' : '/api/mobile/care/stop';
-            const startEndpoint = modoDeteccion === 'ALARMA' ? '/api/mobile/alarm/start' : '/api/mobile/care/start';
+            const endpoint = modoAnterior === 'ALARMA' ? '/api/mobile/alarm/stop' : '/api/mobile/care/stop';
 
             // Llamada para desactivar el modo anterior
             console.log(` -> Desactivando modo ${modoAnterior} para MAC ${dispositivo.macAddress}`);
-            await axios.post(`${externalApiUrl}${stopEndpoint}`, payload);
-
-            // Llamada para activar el nuevo modo
-            console.log(` -> Activando modo ${modoDeteccion} para MAC ${dispositivo.macAddress}`);
-            await axios.post(`${externalApiUrl}${startEndpoint}`, payload);
+            await axios.post(`${externalApiUrl}${endpoint}`, payload);
 
           } catch (apiError) {
             // Si falla la actualización de un dispositivo, lo registramos pero continuamos
@@ -437,10 +440,97 @@ app.put('/api/regiones/:id_reg', async (req, res) => {
     if (direccion !== undefined) region.direccion = direccion;
     if (ciudad !== undefined) region.ciudad = ciudad;
     if (modoDeteccion !== undefined) region.modoDeteccion = modoDeteccion;
+    region.activada = false;
 
     // 7. Guardar cambios
     await region.save();
 
+    res.json({ message: 'Región actualizada correctamente', region });
+
+  } catch (err) {
+    console.error('Error general al actualizar la región:', err);
+    res.status(500).json({ message: 'Error interno al actualizar la región' });
+  }
+});
+
+app.put('/api/regiones/:id_reg/activacion', async (req, res) => {
+  console.log("entro a activacion");
+  const idUsuario = req.session.idUsuario;
+  if (!idUsuario) return res.status(401).json({ message: 'Usuario no autenticado' });
+
+  const { id_reg } = req.params;
+  const { activada } = req.body; // ej: true o false
+
+  // Validamos que 'activada' sea un booleano
+  if (typeof activada !== 'boolean') {
+    return res.status(400).json({ message: 'Valor de "activada" inválido.' });
+  }
+
+  try {
+    // 1. Buscar la región y verificar que pertenece al usuario
+    const region = await Region.findOne({ _id: id_reg, userId: idUsuario });
+    if (!region) {
+      return res.status(404).json({ message: 'Región no encontrada' });
+    }
+
+    // 2. Guardar el estado anterior
+    const estadoAnterior = region.activada;
+
+    // 3. Verificar si el estado realmente cambió
+    // --- ¡CORRECCIÓN 1! ---
+    // Tu lógica anterior (activada && ...) fallaba si 'activada' era 'false'.
+    const estadoCambiado = (activada !== estadoAnterior);
+    // ----------------------
+
+
+    if (estadoCambiado) {
+      console.log(`El estado de activacion de la región '${region.nombre}' cambió de ${estadoAnterior} a ${activada}. Actualizando dispositivos...`);
+
+      // 4. Buscar todos los dispositivos de la región
+      const dispositivos = await Dispositivo.find({ regionId: id_reg });
+
+      if (dispositivos.length > 0) {
+        
+        // 5. Iterar sobre cada dispositivo para activar/desactivarlo
+        let endpoint;
+        
+        // Determinamos el endpoint basado en el *NUEVO* estado ('activada')
+        if (activada) { // Si el switch se puso en ON
+          endpoint = region.modoDeteccion === 'ALARMA' ? '/api/mobile/alarm/start' : '/api/mobile/care/start';
+          console.log(` -> Activando modo ${region.modoDeteccion}`);
+        } else { // Si el switch se puso en OFF
+          endpoint = region.modoDeteccion === 'ALARMA' ? '/api/mobile/alarm/stop' : '/api/mobile/care/stop';
+          console.log(` -> Desactivando modo ${region.modoDeteccion}`);
+        }
+
+        for (const dispositivo of dispositivos) {
+          try {
+            const payload = {
+              mac: dispositivo.macAddress,
+              account_id: idUsuario
+            };
+
+            await axios.post(`${UrlApiCentral}${endpoint}`, payload);
+            console.log(` -> Estado actualizado para MAC ${dispositivo.macAddress}`);
+
+          } catch (apiError) {
+            // Lo registramos pero continuamos (tal como lo tenías)
+            console.error(`Error al actualizar el dispositivo ${dispositivo.macAddress} en la API externa:`, apiError.message);
+          }
+        }
+      }
+    } else {
+      console.log(`El estado de activación ya era ${activada}. No se hizo nada.`);
+    }
+
+    // --- ¡CORRECCIÓN 2! ---
+    // Faltaba guardar el nuevo estado en la base de datos.
+    // Hacemos esto *después* de que las llamadas a la API (si hubo) terminen.
+    region.activada = activada;
+    await region.save();
+    // ----------------------
+
+    // Devolvemos la región actualizada
     res.json({ message: 'Región actualizada correctamente', region });
 
   } catch (err) {
@@ -972,6 +1062,8 @@ const Dispositivo = require('./models/Dispositivo');
 const Camara = require('./models/Camara');
 const Notificacion = require('./models/Notificacion');
 
+//======================================== NOTIFICACIONES ========================================
+
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -983,8 +1075,51 @@ mongoose.connect(process.env.MONGO_URI, {
 const server = require('http').createServer(app);
 const { Server } = require('socket.io');
 const { enviarNotificacion } = require('./services/notificaciones');
+
+// Configura Socket.io
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: {
+    origin: "*", // Permite conexiones desde cualquier origen (para desarrollo local)
+    methods: ["GET", "POST"]
+  }
+});
+
+// Este 'map' rastreará qué socket-id corresponde a qué usuario-id
+// (Formato: { "userIdDelUsuario": "socketIdDelCliente" })
+const userSocketMap = {};
+
+io.on('connection', (socket) => {
+  console.log(`Nuevo cliente conectado: ${socket.id}`);
+
+  // 1. Escuchar un evento de registro del cliente
+  // La app (React Native) debe enviar esto apenas se conecta
+  socket.on('registerUser', (userId) => {
+    if (userId) {
+      userSocketMap[userId] = socket.id;
+      console.log(`Usuario ${userId} registrado con socket ${socket.id}`);
+    }
+  });
+
+  // 2. Manejar desconexión
+  socket.on('disconnect', () => {
+    console.log(`Cliente desconectado: ${socket.id}`);
+    // Encontrar y eliminar al usuario del map
+    for (const userId in userSocketMap) {
+      if (userSocketMap[userId] === socket.id) {
+        delete userSocketMap[userId];
+        console.log(`Usuario ${userId} eliminado del map.`);
+        break;
+      }
+    }
+  });
+});
+
+// --- Middleware para pasar 'io' y 'userSocketMap' a tus rutas ---
+// De esta forma, tu endpoint puede acceder al servidor de sockets
+app.use((req, res, next) => {
+  req.io = io;
+  req.userSocketMap = userSocketMap;
+  next();
 });
 
 app.get('/api/notificacionesmenu', async (req, res) => {
@@ -1076,6 +1211,8 @@ app.post('/api/notificaciones/add', async (req, res) => {
 });
 
 app.post('/api/notificaciones/enviar', async (req, res) => {
+  // Obtenemos 'io' y 'userSocketMap' que pasamos por el middleware
+  const { io, userSocketMap } = req;
   const { dispositivos: macs, tipoEvento, descripcion, criticidad } = req.body;
 
   if (!macs || macs.length === 0) {
@@ -1097,8 +1234,9 @@ app.post('/api/notificaciones/enviar', async (req, res) => {
 
     // 3) Usuario dueño de la región
     const usuario = await Usuario.findById(region.userId);
-    if (!usuario || !usuario.expoToken || usuario.expoToken.length === 0) {
-      return res.status(404).json({ error: 'Usuario sin tokens registrados' });
+    // (Quitamos la validación de 'expoToken' ya que no se usa más)
+    if (!usuario) { 
+      return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
     // 4) Buscar cámaras vinculadas a los dispositivos
@@ -1107,12 +1245,12 @@ app.post('/api/notificaciones/enviar', async (req, res) => {
         const camara = await Camara.findOne({ dispositivoId: disp._id, activo: true });
         return {
           nombre: disp.nombre,
-          url: camara ? camara.streamUrl : null // null si no tiene cámara
+          url: camara ? camara.streamUrl : null 
         };
       })
     );
 
-    // 5) Construir mensaje para notificación push
+    // 5) Construir mensaje para notificación (¡esto lo enviaremos por el socket!)
     const mensaje = {
       titulo: `Alerta ${criticidad.toUpperCase()}: ${tipoEvento}`,
       cuerpo: `${descripcion} en ${region.nombre}`,
@@ -1133,11 +1271,27 @@ app.post('/api/notificaciones/enviar', async (req, res) => {
       regionId: region._id,
       userId: usuario._id
     });
+    if(region.activada){
+          await notificacion.save();
+    }
 
-    await notificacion.save();
-
-    // 7) Enviar push
+    // 7) Enviar Alerta local por WebSocket (EL CAMBIO CLAVE)
+    //    En lugar de: 
     await enviarNotificacion([usuario.expoToken], mensaje);
+
+    await notificacion.populate({ path: 'regionId', select: 'nombre' });
+    
+    const userId = usuario._id.toString();
+    const userSocketId = userSocketMap[userId];
+
+    if (userSocketId && region.activada) {
+      io.to(userSocketId).emit('nueva-notificacion-local', notificacion);
+      //io.to(userSocketId).emit('nueva-notificacion-local', mensaje);
+      console.log(`Alerta local enviada a ${userId} via WebSocket`);
+    } else {
+      // El usuario no está conectado a la app en este momento
+      console.log(`Usuario ${userId} no está conectado via WebSocket. No se envió alerta.`);
+    }
 
     res.json({ success: true, notificacion });
   } catch (error) {
@@ -1166,6 +1320,6 @@ app.delete('/api/notificaciones/:id', async (req, res) => {
 });
 
 // Arrancar servidor
-app.listen(PORT, () => {
-  console.log(`Servidor corriendo en puerto ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Servidor (¡con Sockets!) corriendo en puerto ${PORT}`);
 });
